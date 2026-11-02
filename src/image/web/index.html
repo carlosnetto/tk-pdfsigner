@@ -1,0 +1,281 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PDF Signer</title>
+<style>
+  :root {
+    --bg: #eef0f3; --panel: #ffffff; --text: #1c2430; --muted: #5c6675;
+    --line: #d5dae1; --accent: #1f5fbf; --accent-text: #ffffff; --bad: #b3261e;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #15191f; --panel: #1f252d; --text: #e7ebf0; --muted: #9aa5b3;
+      --line: #36404c; --accent: #6ea4ee; --accent-text: #0e1a2b; --bad: #f2a29c;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.45 system-ui, sans-serif; display: flex; height: 100vh;
+  }
+  aside {
+    width: 300px; flex: none; background: var(--panel); border-right: 1px solid var(--line);
+    padding: 16px; display: flex; flex-direction: column; gap: 14px; overflow-y: auto;
+  }
+  h1 { font-size: 18px; margin: 0; }
+  .muted { color: var(--muted); font-size: 13px; }
+  fieldset { border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; margin: 0; }
+  legend { font-size: 13px; color: var(--muted); padding: 0 4px; }
+  label { display: block; padding: 2px 0; cursor: pointer; }
+  ol { margin: 0; padding: 0; list-style: none; }
+  li {
+    display: flex; justify-content: space-between; align-items: center; gap: 6px;
+    padding: 5px 0; border-bottom: 1px solid var(--line); font-size: 14px;
+  }
+  button { font: inherit; cursor: pointer; }
+  .remove { background: none; border: 0; color: var(--bad); }
+  #sign {
+    background: var(--accent); color: var(--accent-text); border: 0;
+    border-radius: 6px; padding: 10px; font-weight: 600;
+  }
+  #sign:disabled { opacity: .5; cursor: not-allowed; }
+  #status:empty { display: none; }
+  #status.error { color: var(--bad); }
+  main { flex: 1; overflow: auto; padding: 16px; }
+  .page {
+    position: relative; margin: 0 auto 16px; background: #fff;
+    box-shadow: 0 1px 4px rgba(0, 0, 0, .3); cursor: crosshair;
+  }
+  .page.locked { cursor: not-allowed; }
+  .page canvas { display: block; }
+  .stamp, .ghost {
+    position: absolute; border: 2px solid var(--accent); background: rgba(31, 95, 191, .14);
+    color: #123; font-size: 12px; padding: 2px 4px; overflow: hidden; touch-action: none;
+  }
+  .stamp { cursor: move; }
+  .stamp.signature { background: rgba(31, 95, 191, .3); font-weight: 600; }
+  .ghost { pointer-events: none; border-style: dashed; }
+  @media (max-width: 640px) {
+    body { flex-direction: column; height: auto; }
+    aside { width: 100%; border-right: 0; border-bottom: 1px solid var(--line); }
+  }
+</style>
+</head>
+<body>
+<aside>
+  <h1 id="file">PDF Signer</h1>
+  <div class="muted" id="signer"></div>
+  <fieldset>
+    <legend>Stamp size</legend>
+    <label><input type="radio" name="size" value="large" checked> Large</label>
+    <label><input type="radio" name="size" value="small"> Small</label>
+    <label><input type="radio" name="size" value="initials"> Initials</label>
+  </fieldset>
+  <div class="muted">Click on a page to place a stamp, and drag it to move it. The last stamp holds the signature.</div>
+  <ol id="list"></ol>
+  <button id="sign" disabled>Sign</button>
+  <div id="status" role="status"></div>
+  <a id="download" hidden>Download signed PDF</a>
+</aside>
+<main id="pages"></main>
+<script type="module">
+import * as pdfjsLib from './pdf.min.mjs';
+
+pdfjsLib.GlobalWorkerOptions.workerSrc = new URL('pdf.worker.min.mjs', location.href).href;
+
+const MAX_SCALE = 1.5;
+const stamps = [];
+let info;
+let locked = false;
+
+const status = document.getElementById('status');
+const list = document.getElementById('list');
+const signButton = document.getElementById('sign');
+
+function setStatus(text, isError = false) {
+  status.textContent = text;
+  status.classList.toggle('error', isError);
+}
+
+function selectedSize() {
+  return document.querySelector('input[name=size]:checked').value;
+}
+
+function stampPixels(size, scale) {
+  const [width, height] = info.sizes[size];
+  return [width * scale, height * scale];
+}
+
+function clamp(value, low, high) {
+  return Math.min(Math.max(value, low), Math.max(low, high));
+}
+
+function position(element, view, size, event) {
+  const box = view.element.getBoundingClientRect();
+  const [width, height] = stampPixels(size, view.scale);
+  const left = clamp(event.clientX - box.left - width / 2, 0, box.width - width);
+  const top = clamp(event.clientY - box.top - height / 2, 0, box.height - height);
+  element.style.left = `${left}px`;
+  element.style.top = `${top}px`;
+  element.style.width = `${width}px`;
+  element.style.height = `${height}px`;
+  return { left, top };
+}
+
+function refresh() {
+  list.replaceChildren();
+  stamps.forEach((stamp, index) => {
+    const last = index === stamps.length - 1;
+    stamp.element.classList.toggle('signature', last);
+    stamp.element.textContent = last ? 'Signature' : 'Stamp';
+    const item = document.createElement('li');
+    const label = document.createElement('span');
+    label.textContent = `Page ${stamp.view.number}, ${stamp.size}${last ? ' (signature)' : ''}`;
+    const remove = document.createElement('button');
+    remove.className = 'remove';
+    remove.textContent = 'Remove';
+    remove.disabled = locked;
+    remove.addEventListener('click', () => {
+      stamp.element.remove();
+      stamps.splice(stamps.indexOf(stamp), 1);
+      refresh();
+    });
+    item.append(label, remove);
+    list.append(item);
+  });
+  signButton.disabled = locked || stamps.length === 0;
+}
+
+function addStamp(view, size, event) {
+  const element = document.createElement('div');
+  element.className = 'stamp';
+  const stamp = { view, size, element, ...position(element, view, size, event) };
+  element.addEventListener('pointerdown', (down) => {
+    if (locked) return;
+    down.stopPropagation();
+    element.setPointerCapture(down.pointerId);
+    const box = element.getBoundingClientRect();
+    const offsetX = down.clientX - (box.left + box.width / 2);
+    const offsetY = down.clientY - (box.top + box.height / 2);
+    const move = (moved) => Object.assign(stamp, position(element, view, size, {
+      clientX: moved.clientX - offsetX,
+      clientY: moved.clientY - offsetY,
+    }));
+    element.addEventListener('pointermove', move);
+    element.addEventListener('pointerup', () => element.removeEventListener('pointermove', move), { once: true });
+  });
+  element.addEventListener('click', (click) => click.stopPropagation());
+  view.element.append(element);
+  stamps.push(stamp);
+  refresh();
+}
+
+function watchPage(view) {
+  const ghost = document.createElement('div');
+  ghost.className = 'ghost';
+  ghost.hidden = true;
+  view.element.append(ghost);
+  view.element.addEventListener('pointermove', (event) => {
+    ghost.hidden = locked || event.target.closest('.stamp') !== null;
+    position(ghost, view, selectedSize(), event);
+  });
+  view.element.addEventListener('pointerleave', () => { ghost.hidden = true; });
+  view.element.addEventListener('click', (event) => {
+    if (!locked) addStamp(view, selectedSize(), event);
+  });
+}
+
+async function renderPage(pdf, number, available) {
+  const page = await pdf.getPage(number);
+  const scale = Math.min(MAX_SCALE, available / page.getViewport({ scale: 1 }).width);
+  const viewport = page.getViewport({ scale });
+  const ratio = window.devicePixelRatio || 1;
+
+  const element = document.createElement('div');
+  element.className = 'page';
+  element.dataset.page = number;
+  element.style.width = `${viewport.width}px`;
+  element.style.height = `${viewport.height}px`;
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.floor(viewport.width * ratio);
+  canvas.height = Math.floor(viewport.height * ratio);
+  canvas.style.width = `${viewport.width}px`;
+  canvas.style.height = `${viewport.height}px`;
+  element.append(canvas);
+  document.getElementById('pages').append(element);
+
+  await page.render({
+    canvasContext: canvas.getContext('2d'),
+    viewport,
+    transform: ratio === 1 ? null : [ratio, 0, 0, ratio, 0, 0],
+  }).promise;
+
+  const view = { number, scale, viewport, element };
+  if (info.rotated.includes(number)) {
+    element.classList.add('locked');
+    element.title = 'Rotated pages cannot be stamped yet.';
+  } else {
+    watchPage(view);
+  }
+}
+
+async function sign() {
+  locked = true;
+  refresh();
+  setStatus('Type your PIN in the terminal.');
+  const body = stamps.map((stamp) => {
+    const [x, y] = stamp.view.viewport.convertToPdfPoint(stamp.left, stamp.top);
+    return { page: stamp.view.number, x: Math.round(x), y: Math.round(y), size: stamp.size };
+  });
+  try {
+    const response = await fetch('sign', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ stamps: body }),
+    });
+    const result = await response.json();
+    if (response.ok) {
+      const link = document.getElementById('download');
+      link.href = result.download;
+      link.download = result.name;
+      link.hidden = false;
+      setStatus(`Signed: ${result.name}`);
+      return;
+    }
+    setStatus(result.error, true);
+    if (response.status === 400) {
+      locked = false;
+      refresh();
+    }
+  } catch {
+    setStatus('Lost the connection to the signing program.', true);
+  }
+}
+
+async function start() {
+  info = await (await fetch('info')).json();
+  document.getElementById('file').textContent = info.file;
+  document.getElementById('signer').textContent = `Signing as ${info.signer}`;
+  if (info.signatures) {
+    setStatus('This PDF already has signatures, so place only one stamp.');
+  }
+  if (info.rotated.length) {
+    setStatus(`Rotated pages cannot be stamped yet: ${info.rotated.join(', ')}.`);
+  }
+  signButton.addEventListener('click', sign);
+
+  const data = await (await fetch('document.pdf')).arrayBuffer();
+  const pdf = await pdfjsLib.getDocument({ data }).promise;
+  const main = document.getElementById('pages');
+  const available = main.clientWidth - 32;
+  for (let number = 1; number <= pdf.numPages; number += 1) {
+    await renderPage(pdf, number, available);
+  }
+}
+
+start().catch((error) => setStatus(`Could not open the PDF: ${error.message}`, true));
+</script>
+</body>
+</html>

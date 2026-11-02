@@ -1,0 +1,21 @@
+# Proprietary driver, downloaded during the image build instead
+vendor/
+
+# Documents, which can hold personal data
+*.pdf
+*.jpg
+
+# Build output
+*.pyz
+__pycache__/
+
+# Copied by build-pyz.py
+src/LICENSE
+src/image/watermark.png
+
+# Superseded by src/
+/Dockerfile
+/compose.yaml
+/entrypoint.sh
+/sign-pdf
+/sign.py
