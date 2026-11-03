@@ -4,21 +4,33 @@ Signs PDF files with a digital certificate on a smart card, such as a Brazilian 
 
 You open the PDF in a browser, click where each stamp should appear, and type the PIN in the terminal. The result is a real digital signature, not a picture of one. Each stamp is a visible mark, and anyone can check the signature with a validator such as [validar.iti.gov.br](https://validar.iti.gov.br).
 
-## Nothing is installed on the host
+It runs on Linux and macOS. The same `pdf-signer.pyz` detects the system, so there is no option to choose.
 
-Everything runs inside a Docker container: the card service (`pcscd`), the reader driver, the SafeSign card library, Python libraries and the signing program. This tool installs no packages or drivers on your Linux system. To remove all of it, run `python3 pdf-signer.pyz uninstall`.
+## Nothing is installed in the system
+
+- **Linux:** everything runs inside a Docker container: the card service (`pcscd`), the reader driver, the SafeSign card library, Python libraries and the signing program. No packages or drivers are installed on the host.
+- **macOS:** Docker cannot reach USB card readers on a Mac, so the signer runs on the host. Its Python libraries go into a private venv in `~/Library/Caches/pdf-signer/`, not into the system Python. The card service and reader driver are built into macOS. Only SafeSign is installed, by you, from G+D.
+
+To remove what this tool created, run `python3 pdf-signer.pyz uninstall`.
 
 ## Requirements
 
-On the computer with the card reader:
+### Linux
 
-- Linux
 - Docker, usable without `sudo`
 - Python 3, which only starts the program
 - `pcscd` not running on the host, because only one service can use the reader at a time
 - Internet access, for the first build and for checking the certificate when signing
 
 The first run builds the Docker image, which takes a few minutes. Later runs reuse it and start in seconds. The build downloads SafeSign from the G+D site and verifies its checksum. SafeSign is proprietary, so it is not distributed with this tool.
+
+### macOS
+
+- Python 3.12 or later, such as Homebrew's: `brew install python`. Apple's `/usr/bin/python3` is too old.
+- [SafeSign IC Standard for macOS](https://safesign.gdamericadosul.com.br/download), which installs `tokenadmin.app` and the card library. Apple Silicon and Intel both work.
+- Internet access, for the first run and for checking the certificate when signing
+
+The first run creates the venv, which takes about a minute. Later runs reuse it. A new `pdf-signer.pyz` or a Python upgrade creates a fresh one, and the old one is deleted.
 
 ## Usage
 
@@ -109,6 +121,13 @@ Before asking for the PIN, the program verifies the certificate chain and asks t
 
 Use `--no-validation-data` to sign offline without them. Only ICP-Brasil root v5 is trusted, so certificates under other roots stop with an error.
 
+## macOS notes
+
+- **SafeSign elsewhere.** The card library is expected at `/Applications/tokenadmin.app/Contents/Frameworks/libaetpkss.dylib`. If it is somewhere else, set `PDF_SIGNER_MODULE` to its path.
+- **Idle cards.** After a card sits idle, macOS powers it down. Some cards, such as the Certisign e-CPF (YpsID S2), then fail to power up when SafeSign connects, and SafeSign reports the card as not recognised. The signer prevents this by connecting to the card first with the T=0 protocol and keeping that connection open while it runs. Nothing needs to be done, and tokenadmin does not need to be open.
+- **tokenadmin** can stay open while signing. It shares the reader.
+- **The page** only listens on `127.0.0.1`, so it is not reachable from the network. The SSH tunnel steps above work the same way on a Mac.
+
 ## Limits
 
 - A PDF that already has signatures accepts only one stamp.
@@ -127,7 +146,7 @@ make clean    # deletes pdf-signer.pyz
 
 Without `make`, run `python3 build-pyz.py`.
 
-`pdf-signer.pyz` is a single file containing the program, the web page, PDF.js, the watermark, the ICP-Brasil root certificate and the Dockerfile. Copy that one file to any computer that meets the requirements.
+`pdf-signer.pyz` is a single file containing the program, the web page, PDF.js, the stamp font, the watermark, the ICP-Brasil root certificate and the Dockerfile. Copy that one file to any computer that meets the requirements.
 
 ## License
 
@@ -138,5 +157,6 @@ Copyright (c) 2026 Carlos Augusto Leite Netto.
 Third-party software:
 
 - [PDF.js](https://github.com/mozilla/pdf.js) is included under the Apache License 2.0, see `src/image/web/PDFJS-LICENSE`.
-- [pyHanko](https://github.com/MatthiasValvekens/pyHanko) is installed in the image during the build, under its own license.
+- [TeX Gyre Heros](https://www.gust.org.pl/projects/e-foundry/tex-gyre/heros), the stamp font, is included under the GUST Font License, see `src/image/fonts/GUST-FONT-LICENSE.txt`.
+- [pyHanko](https://github.com/MatthiasValvekens/pyHanko) is installed during the first run (the Docker image on Linux, the venv on macOS), under its own license.
 - SafeSign is proprietary. It is downloaded during the build, under its own license terms, and is not part of this project.

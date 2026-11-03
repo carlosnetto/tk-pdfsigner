@@ -2,10 +2,12 @@
 """Sign PDFs with a PKCS#11 smart card. Makes one PIN attempt per run, never more."""
 import argparse
 import asyncio
+import ctypes
 import getpass
 import http.server
 import io
 import json
+import logging
 import math
 import os
 import sys
@@ -33,13 +35,19 @@ from pyhanko_certvalidator import CertificateValidator, ValidationContext
 from pyhanko_certvalidator.errors import RevokedError
 from pyhanko_certvalidator.fetchers.requests_fetchers import RequestsFetcherBackend
 
-DEFAULT_MODULE = "/usr/lib/libaetpkss.so"
-FONT = "/usr/share/fonts/opentype/urw-base35/NimbusSans-Regular.otf"
+DEFAULT_MODULE = os.environ.get("PDF_SIGNER_MODULE") or (
+    "/Applications/tokenadmin.app/Contents/Frameworks/libaetpkss.dylib"
+    if sys.platform == "darwin"
+    else "/usr/lib/libaetpkss.so"
+)
+# A CFF font with 1000 units per em. pyHanko 0.38 writes glyph widths in font units,
+# so TrueType fonts (usually 2048 per em) come out with letters spread apart.
+FONT = str(Path(__file__).parent / "fonts" / "texgyreheros-regular.otf")
 TIME_FORMAT = "%d/%m/%Y %H:%M:%S %:z"
 PAGE_MARGIN = 24
 WEB_DIR = Path(__file__).parent / "web"
 ROOTS_DIR = Path(__file__).parent / "roots"
-WATERMARK = Path(__file__).parent / "watermark.png"
+WATERMARK = Path(os.environ.get("PDF_SIGNER_WATERMARK") or Path(__file__).parent / "watermark.png")
 MAX_STAMPS = 200
 DOWNLOAD_WINDOW_SECONDS = 300
 ANCHORS = ("bottom-left", "bottom-center", "bottom-right")
@@ -87,11 +95,64 @@ SIZES = {
 UNSAFE_PIN_FLAGS = (TokenFlag.USER_PIN_LOCKED, TokenFlag.USER_PIN_FINAL_TRY)
 
 
+# The font has no CID metadata, which pyHanko handles correctly but warns about.
+logging.getLogger("pyhanko.pdf_utils.font.opentype").setLevel(logging.ERROR)
+
+# Connections opened by power_cards_t0(). They stay open until the process exits.
+_PCSC_HANDLES = []
+
+
+def power_cards_t0():
+    """macOS only: open a shared T=0 connection to every reader, and keep it open.
+
+    SafeSign connects asking for T=0 or T=1. With an idle, powered-down card (the
+    Certisign YpsID S2 e-CPF, for one), the macOS CCID driver then fails to power it
+    up and reports SCARD_W_UNRESPONSIVE_CARD, which SafeSign turns into "token not
+    recognised". A T=0 connection powers the card up correctly. Holding it open keeps
+    the card powered and on T=0 while SafeSign shares it. Failures are ignored, and
+    SafeSign then reports the problem itself.
+    """
+    try:
+        pcsc = ctypes.CDLL("/System/Library/Frameworks/PCSC.framework/PCSC")
+        context = ctypes.c_int32()
+        if pcsc.SCardEstablishContext(2, None, None, ctypes.byref(context)):  # SYSTEM scope
+            return
+        size = ctypes.c_uint32()
+        if pcsc.SCardListReaders(context, None, None, ctypes.byref(size)):
+            return
+        names = ctypes.create_string_buffer(size.value)
+        if pcsc.SCardListReaders(context, None, names, ctypes.byref(size)):
+            return
+        for reader in filter(None, names.raw.split(b"\0")):
+            card, protocol = ctypes.c_int32(), ctypes.c_uint32()
+            # 2 = SCARD_SHARE_SHARED, 1 = SCARD_PROTOCOL_T0
+            if pcsc.SCardConnect(context, reader, 2, 1, ctypes.byref(card), ctypes.byref(protocol)) == 0:
+                _PCSC_HANDLES.append(card)
+        _PCSC_HANDLES.append(context)
+    except OSError:
+        pass
+
+
 def find_token(module):
+    if not Path(module).is_file():
+        message = f"SafeSign library not found: {module}"
+        if sys.platform == "darwin":
+            message += (
+                "\nInstall SafeSign for macOS from https://safesign.gdamericadosul.com.br/download"
+                "\nIf it is installed elsewhere, set PDF_SIGNER_MODULE to its libaetpkss.dylib."
+            )
+        sys.exit(message)
+    if sys.platform == "darwin":
+        power_cards_t0()
     slots = pkcs11.lib(module).get_slots(token_present=True)
     if not slots:
         sys.exit("No card found.")
-    return slots[0].get_token()
+    for slot in slots:
+        try:
+            return slot.get_token()
+        except pkcs11.exceptions.TokenNotRecognised:
+            continue
+    sys.exit("A card is in the reader, but SafeSign does not recognise it.")
 
 
 def read_certs(session):
@@ -593,7 +654,8 @@ def cmd_pick(args):
     port = int(os.environ["PDF_SIGNER_PORT"])
     job = prepare(args)
     state = PickState(job, token)
-    server = http.server.HTTPServer(("0.0.0.0", port), PickHandler)
+    host = os.environ.get("PDF_SIGNER_HOST", "127.0.0.1")
+    server = http.server.HTTPServer((host, port), PickHandler)
     server.state = state
     server.timeout = 1
     print("Waiting for the browser. Press Ctrl+C to cancel.", flush=True)

@@ -1,4 +1,9 @@
-"""PDF Signer launcher. Runs the signer in Docker, so the host stays clean of card drivers."""
+"""PDF Signer launcher.
+
+On Linux the signer runs in Docker, so the host stays clean of card drivers. On macOS
+Docker cannot reach the USB card reader, so the signer runs on the host, in a private
+venv under ~/Library/Caches/pdf-signer.
+"""
 import argparse
 import hashlib
 import os
@@ -21,6 +26,9 @@ IMAGE_DIR = "image/"
 DEFAULT_PORT = 8765
 DEFAULT_TIMEZONE = "America/Sao_Paulo"
 READY_TIMEOUT_SECONDS = 60
+MAC = sys.platform == "darwin"
+CACHE_ROOT = Path.home() / "Library" / "Caches" / "pdf-signer"
+MIN_PYTHON = (3, 12)
 
 
 def image_files():
@@ -34,16 +42,22 @@ def image_files():
     with zipfile.ZipFile(location) as archive:
         for name in sorted(archive.namelist()):
             if name.startswith(IMAGE_DIR) and not name.endswith("/"):
-                yield name[len(IMAGE_DIR) :], archive.read(name)
+                yield name[len(IMAGE_DIR):], archive.read(name)
 
 
-def ensure_image():
-    files = list(image_files())
+def files_digest(files, *extra):
     digest = hashlib.sha256()
     for name, content in files:
         digest.update(name.encode())
         digest.update(content)
-    tag = f"{IMAGE_PREFIX}:{digest.hexdigest()[:12]}"
+    for item in extra:
+        digest.update(item.encode())
+    return digest.hexdigest()[:12]
+
+
+def ensure_image():
+    files = list(image_files())
+    tag = f"{IMAGE_PREFIX}:{files_digest(files)}"
     found = subprocess.run(
         ["docker", "image", "inspect", tag], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     )
@@ -70,12 +84,13 @@ def timezone():
 
 def watermark_override():
     """A watermark.png beside the .pyz replaces the bundled one, with no rebuild."""
-    replacement = Path(__file__).resolve().parent.parent / "watermark.png"
-    return ["-v", f"{replacement}:/app/watermark.png:ro"] if replacement.is_file() else []
+    candidate = Path(__file__).resolve().parent.parent / "watermark.png"
+    return candidate if candidate.is_file() else None
 
 
 def docker_command(image, work_dir, extra=()):
     tty = ["-it"] if sys.stdin.isatty() else ["-i"]
+    watermark = watermark_override()
     return [
         "docker", "run", "--rm", *tty,
         "--device-cgroup-rule=c 189:* rmw",
@@ -84,10 +99,73 @@ def docker_command(image, work_dir, extra=()):
         "-v", f"{work_dir}:/work",
         "-w", "/work",
         "-e", f"TZ={timezone()}",
-        *watermark_override(),
+        # The port is published on 127.0.0.1 by -p, so listening on all
+        # interfaces inside the container does not expose it to the network.
+        "-e", "PDF_SIGNER_HOST=0.0.0.0",
+        *(["-v", f"{watermark}:/app/watermark.png:ro"] if watermark else []),
         *extra,
         image, "/opt/venv/bin/python", "/app/sign.py",
     ]
+
+
+def ensure_venv():
+    """Create, or reuse, the venv and unpacked signer for this .pyz and this Python.
+
+    The folder name hashes the signer files and the interpreter, so a new .pyz or a
+    Python upgrade (Homebrew removes the old one) gets a fresh setup. Older folders
+    are deleted once the new one is ready.
+    """
+    if sys.version_info < MIN_PYTHON:
+        sys.exit(
+            f"Python {'.'.join(map(str, MIN_PYTHON))} or later is required, this is "
+            f"{sys.version.split()[0]} ({sys.executable}).\n"
+            "Install it with: brew install python, then run: python3 pdf-signer.pyz ..."
+        )
+    files = list(image_files())
+    folder = CACHE_ROOT / files_digest(files, sys.version, str(Path(sys.executable).resolve()))
+    ready = folder / "ready"
+    if ready.exists():
+        return folder
+    # A venv cannot be moved after creation, so it is built in place. The "ready"
+    # marker is written last, so an interrupted setup is detected and redone.
+    print("Setting up the signer. This takes a minute or two the first time.", flush=True)
+    shutil.rmtree(folder, ignore_errors=True)
+    for name, content in files:
+        target = folder / "app" / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+    venv = folder / "venv"
+    subprocess.run([sys.executable, "-m", "venv", str(venv)], check=True)
+    subprocess.run(
+        [str(venv / "bin" / "python"), "-m", "pip", "install", "--quiet",
+         "--disable-pip-version-check", "-r", str(folder / "app" / "requirements.txt")],
+        check=True,
+    )
+    ready.touch()
+    for old in CACHE_ROOT.iterdir():
+        if old != folder:
+            shutil.rmtree(old, ignore_errors=True)
+    return folder
+
+
+def signer_command(work_dir):
+    """The command that runs sign.py: in Docker on Linux, on the host on macOS."""
+    if not MAC:
+        return docker_command(ensure_image(), work_dir)
+    folder = ensure_venv()
+    os.environ["PDF_SIGNER_HOST"] = "127.0.0.1"
+    watermark = watermark_override()
+    if watermark:
+        os.environ["PDF_SIGNER_WATERMARK"] = str(watermark)
+    return [str(folder / "venv" / "bin" / "python"), str(folder / "app" / "sign.py")]
+
+
+def run_on_host(command, cwd):
+    """Ctrl+C reaches the signer directly, so only the launcher's traceback is hidden."""
+    try:
+        return subprocess.run(command, cwd=cwd).returncode
+    except KeyboardInterrupt:
+        return 130
 
 
 def port_is_free(port):
@@ -173,7 +251,6 @@ def pick(args):
     if output.exists():
         sys.exit(f"Output already exists: {output}")
 
-    image = ensure_image()
     token = secrets.token_urlsafe(32)
     if args.port:
         if not port_is_free(args.port):
@@ -184,18 +261,22 @@ def pick(args):
         port = choose_port(token)
 
     os.environ["PDF_SIGNER_TOKEN"] = token
+    os.environ["PDF_SIGNER_PORT"] = str(port)
+    flags = ["pick", source.name, output.name]
+    if args.allow_low_pin_count:
+        flags.append("--allow-low-pin-count")
+    if args.no_validation_data:
+        flags.append("--no-validation-data")
+
+    if MAC:
+        return run_on_host([*signer_command(source.parent), *flags], source.parent)
     extra = [
         "-p", f"127.0.0.1:{port}:{port}",
         "-e", "PDF_SIGNER_TOKEN",
-        "-e", f"PDF_SIGNER_PORT={port}",
+        "-e", "PDF_SIGNER_PORT",
     ]
-    command = docker_command(image, source.parent, extra)
-    command += ["pick", source.name, output.name]
-    if args.allow_low_pin_count:
-        command.append("--allow-low-pin-count")
-    if args.no_validation_data:
-        command.append("--no-validation-data")
-    return run_named(command, f"pdf-signer-{secrets.token_hex(4)}")
+    command = docker_command(ensure_image(), source.parent, extra)
+    return run_named([*command, *flags], f"pdf-signer-{secrets.token_hex(4)}")
 
 
 def run_named(command, name):
@@ -221,7 +302,24 @@ def docker_lines(*args):
 
 
 def uninstall():
-    """Remove this tool's containers and images. The next run builds them again."""
+    """Remove what this tool created. The next run sets it up again."""
+    return uninstall_venv() if MAC else uninstall_docker()
+
+
+def uninstall_venv():
+    if not CACHE_ROOT.is_dir():
+        print("Nothing to remove.")
+        return 0
+    print(f"Folder to remove: {CACHE_ROOT}")
+    if input("Remove it? [y/N]: ").strip().lower() != "y":
+        print("Nothing was removed.")
+        return 0
+    shutil.rmtree(CACHE_ROOT)
+    print("Removed. SafeSign was installed separately, remove it with its own uninstaller.")
+    return 0
+
+
+def uninstall_docker():
     containers = docker_lines("ps", "-aq", "--filter", f"name=^{IMAGE_PREFIX}-")
     images = docker_lines(
         "image", "ls", "--format", "{{.Repository}}:{{.Tag}} ({{.Size}})",
@@ -248,13 +346,14 @@ def uninstall():
 
 
 def main():
-    if shutil.which("docker") is None:
+    if not MAC and shutil.which("docker") is None:
         sys.exit("Docker is required, and it was not found.")
     if sys.argv[1:] == ["uninstall"]:
         return uninstall()
     if len(sys.argv) > 1 and sys.argv[1] in ("sign", "list"):
-        command = docker_command(ensure_image(), Path.cwd())
-        return subprocess.run([*command, *sys.argv[1:]]).returncode
+        if MAC:
+            return run_on_host([*signer_command(Path.cwd()), *sys.argv[1:]], Path.cwd())
+        return subprocess.run([*signer_command(Path.cwd()), *sys.argv[1:]]).returncode
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("pdf")

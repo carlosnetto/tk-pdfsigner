@@ -6,13 +6,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends unzip \
     && unzip -j /tmp/safesign.zip '*.deb' -d /tmp/safesign \
     && mv /tmp/safesign/*.deb /tmp/safesign.deb \
     && apt-get install -y --no-install-recommends \
-       pcscd libccid opensc pcsc-tools python3-venv fonts-urw-base35 tzdata /tmp/safesign.deb \
+       pcscd libccid opensc pcsc-tools python3-venv tzdata /tmp/safesign.deb \
     && rm -rf /var/lib/apt/lists/* /tmp/safesign /tmp/safesign.deb /tmp/safesign.zip
+COPY requirements.txt /app/requirements.txt
 RUN python3 -m venv /opt/venv \
-    && /opt/venv/bin/pip install --no-cache-dir "pyHanko[pkcs11,opentype,image-support]==0.38.0" requests
+    && /opt/venv/bin/pip install --no-cache-dir -r /app/requirements.txt
 COPY entrypoint.sh /entrypoint.sh
 COPY sign.py /app/sign.py
 COPY web /app/web
 COPY roots /app/roots
+COPY fonts /app/fonts
 COPY watermark.png /app/watermark.png
 ENTRYPOINT ["sh", "/entrypoint.sh"]
